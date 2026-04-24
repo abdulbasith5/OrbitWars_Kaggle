@@ -1,12 +1,12 @@
 """
-policy.py — PlanetPolicy neural network.
+policy.py — PlanetPolicy v2 (Elite upgrade).
 
-Architecture:
-  1. Source encoder : MLP([self_features || global_features]) → planet_emb
-  2. Candidate encoder: MLP(candidate_features) → cand_emb  (per candidate)
-  3. Dot-product attention : planet_emb · cand_emb → logits over N candidates
-  4. Masked softmax → action probabilities
-  5. Value head : MLP(planet_emb.mean) → scalar baseline (for PPO)
+Architecture upgrades:
+  1. Deeper MLP: 3 layers instead of 2, larger hidden size (512 default)
+  2. Multi-head attention (4 heads) instead of plain dot-product
+  3. Residual connections in src/candidate encoders
+  4. Richer value head: 3-layer MLP with dropout
+  5. Layer normalization throughout
 """
 from __future__ import annotations
 
@@ -24,8 +24,9 @@ class PolicyOutput:
     entropy: torch.Tensor      # [B]     per-source entropy
 
 
-class MLP(nn.Module):
-    def __init__(self, in_dim: int, hidden: int, out_dim: int, layers: int = 2):
+class ResidualMLP(nn.Module):
+    """MLP with residual connection when in_dim == out_dim."""
+    def __init__(self, in_dim: int, hidden: int, out_dim: int, layers: int = 3, dropout: float = 0.1):
         super().__init__()
         dims = [in_dim] + [hidden] * (layers - 1) + [out_dim]
         mods = []
@@ -33,17 +34,53 @@ class MLP(nn.Module):
             mods.append(nn.Linear(dims[i], dims[i+1]))
             if i < len(dims) - 2:
                 mods.append(nn.LayerNorm(dims[i+1]))
-                mods.append(nn.ReLU())
+                mods.append(nn.GELU())
+                if dropout > 0:
+                    mods.append(nn.Dropout(dropout))
         self.net = nn.Sequential(*mods)
+        # Residual projection if needed
+        self.residual = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
 
     def forward(self, x):
-        return self.net(x)
+        return self.net(x) + self.residual(x)
+
+
+class MultiHeadAttentionScorer(nn.Module):
+    """
+    Multi-head attention between source planet query and candidate keys.
+    Produces a score per candidate.
+    """
+    def __init__(self, embed_dim: int, num_heads: int = 4):
+        super().__init__()
+        self.num_heads  = num_heads
+        self.head_dim   = embed_dim // num_heads
+        assert self.head_dim * num_heads == embed_dim
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.scale  = self.head_dim ** -0.5
+
+    def forward(self, query: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
+        """
+        query: [B, H]   (source planet embedding)
+        keys:  [B, N, H] (candidate embeddings)
+        returns: [B, N] attention scores
+        """
+        B, N, H = keys.shape
+        Q = self.q_proj(query).view(B, self.num_heads, self.head_dim)       # [B, heads, head_dim]
+        K = self.k_proj(keys.view(B * N, H)).view(B, N, self.num_heads, self.head_dim)  # [B, N, heads, d]
+        # Dot product per head: [B, heads, N]
+        scores = torch.einsum("bhd,bnhd->bhn", Q, K) * self.scale          # [B, heads, N]
+        # Average across heads
+        return scores.mean(dim=1)                                            # [B, N]
 
 
 class PlanetPolicy(nn.Module):
     """
-    For each source planet, picks one of N candidate targets (or "do nothing").
-    Shares the candidate encoder across all candidates for efficiency.
+    v2 Elite PlanetPolicy:
+    - Residual MLP encoders (3 layers)
+    - Multi-head attention scoring (4 heads)
+    - Richer 3-layer value head
+    - Larger hidden size (512 recommended)
     """
 
     def __init__(
@@ -52,22 +89,34 @@ class PlanetPolicy(nn.Module):
         candidate_dim: int,
         global_dim: int,
         candidate_count: int,
-        hidden_size: int = 256,
+        hidden_size: int = 512,
+        num_heads: int = 4,
+        dropout: float = 0.05,
     ):
         super().__init__()
         self.candidate_count = candidate_count
 
-        # Source encoder: combine self + global features
-        self.src_encoder = MLP(self_dim + global_dim, hidden_size, hidden_size)
+        # Source encoder: self + global → embedding
+        self.src_encoder = ResidualMLP(
+            self_dim + global_dim, hidden_size, hidden_size, layers=3, dropout=dropout)
 
         # Candidate encoder: shared across all N candidates
-        self.cand_encoder = MLP(candidate_dim, hidden_size, hidden_size)
+        self.cand_encoder = ResidualMLP(
+            candidate_dim, hidden_size, hidden_size, layers=3, dropout=dropout)
 
-        # Attention projection (optional learnable scale)
-        self.attn_scale = nn.Parameter(torch.tensor(hidden_size ** -0.5))
+        # Multi-head attention scorer
+        self.attn = MultiHeadAttentionScorer(hidden_size, num_heads=num_heads)
 
-        # Value head — estimates expected future return
-        self.value_head = MLP(hidden_size, hidden_size // 2, 1, layers=2)
+        # Value head — 3-layer with dropout
+        self.value_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.LayerNorm(hidden_size // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size // 2, hidden_size // 4),
+            nn.GELU(),
+            nn.Linear(hidden_size // 4, 1),
+        )
 
     def forward(
         self,
@@ -79,19 +128,17 @@ class PlanetPolicy(nn.Module):
         B, N, _ = cand_feat.shape
 
         # 1. Encode source planet
-        src_input  = torch.cat([self_feat, global_feat], dim=-1)   # [B, self+global]
-        planet_emb = self.src_encoder(src_input)                   # [B, H]
+        src_input  = torch.cat([self_feat, global_feat], dim=-1)
+        planet_emb = self.src_encoder(src_input)              # [B, H]
 
         # 2. Encode candidates (flatten → encode → reshape)
-        cand_flat  = cand_feat.view(B * N, -1)                    # [B*N, cand_dim]
+        cand_flat  = cand_feat.view(B * N, -1)
         cand_emb   = self.cand_encoder(cand_flat).view(B, N, -1)  # [B, N, H]
 
-        # 3. Dot-product attention: planet queries each candidate
-        # planet_emb [B, H] → [B, 1, H]
-        query  = planet_emb.unsqueeze(1)                          # [B, 1, H]
-        logits = (query * cand_emb).sum(dim=-1) * self.attn_scale # [B, N]
+        # 3. Multi-head attention scoring
+        logits = self.attn(planet_emb, cand_emb)              # [B, N]
 
-        # 4. Mask invalid candidates with -inf before softmax
+        # 4. Mask invalid candidates
         logits = logits.masked_fill(~cand_mask, float("-inf"))
 
         # 5. Log-probs and entropy
@@ -99,8 +146,8 @@ class PlanetPolicy(nn.Module):
         probs     = log_probs.exp()
         entropy   = -(probs * log_probs.clamp(min=-1e9)).sum(dim=-1)  # [B]
 
-        # 6. Value baseline (average over planet embeddings → scalar)
-        value = self.value_head(planet_emb).squeeze(-1)            # [B]
+        # 6. Value baseline
+        value = self.value_head(planet_emb).squeeze(-1)        # [B]
 
         return PolicyOutput(
             logits=logits,

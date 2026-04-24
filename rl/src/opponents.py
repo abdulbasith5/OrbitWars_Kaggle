@@ -1,8 +1,9 @@
 """
-opponents.py — Opponent agent wrappers for training.
-  - RandomOpponent  : calls the built-in random agent
-  - SelfPlayOpponent: runs a frozen copy of our own policy
-  - V9Opponent      : loads and runs main.py (our v9 heuristic)
+opponents.py — Opponent agent wrappers v2.
+  - RandomOpponent   : random moves
+  - SelfPlayOpponent : frozen copy of our own policy
+  - V11Opponent      : loads and runs main.py (v11 heuristic) — primary training opponent
+  - V9Opponent       : legacy v9 (kept for compatibility)
 """
 from __future__ import annotations
 
@@ -19,8 +20,6 @@ import numpy as np
 class RandomOpponent:
     """Wraps kaggle's built-in random agent."""
     def act(self, obs: Any) -> list:
-        # Return empty — the kaggle env handles "random" internally
-        # but we need to act for the side we control
         return self._random_moves(obs)
 
     def _random_moves(self, obs: Any) -> list:
@@ -33,13 +32,13 @@ class RandomOpponent:
             planets = getattr(obs, "planets", [])
         moves = []
         for p in planets:
-            if p[1] != player: continue  # not mine
+            if p[1] != player: continue
             ships = p[5]
             if ships < 10: continue
             send  = random.randint(5, int(ships // 2))
             angle = random.uniform(-math.pi, math.pi)
             moves.append([p[0], angle, send])
-        return moves[:2]  # max 2 random moves
+        return moves[:2]
 
 
 class SelfPlayOpponent:
@@ -50,11 +49,13 @@ class SelfPlayOpponent:
         self.cfg    = cfg
         self.device = device
         self.policy = PlanetPolicy(
-            self_dim      = self_feature_dim(),
-            candidate_dim = candidate_feature_dim(),
-            global_dim    = global_feature_dim(),
+            self_dim        = self_feature_dim(),
+            candidate_dim   = candidate_feature_dim(),
+            global_dim      = global_feature_dim(),
             candidate_count = cfg.env.candidate_count,
-            hidden_size   = cfg.model.hidden_size,
+            hidden_size     = cfg.model.hidden_size,
+            num_heads       = cfg.model.num_heads,
+            dropout         = 0.0,   # no dropout at inference
         ).to(device)
         self.policy.eval()
 
@@ -88,8 +89,25 @@ class SelfPlayOpponent:
         return moves
 
 
+class V11Opponent:
+    """Runs the v11 heuristic agent from main.py as the opponent.
+    Primary training opponent — much stronger than random."""
+    def __init__(self, main_path: str = "../main.py"):
+        path = Path(main_path).resolve()
+        spec = importlib.util.spec_from_file_location("v11_agent", path)
+        mod  = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self._agent = mod.agent
+
+    def act(self, obs: Any) -> list:
+        try:
+            return list(self._agent(obs)) or []
+        except Exception:
+            return []
+
+
 class V9Opponent:
-    """Runs the v9 heuristic agent from main.py as the opponent."""
+    """Legacy v9 heuristic (kept for compatibility)."""
     def __init__(self, main_path: str = "../main.py"):
         path = Path(main_path).resolve()
         spec = importlib.util.spec_from_file_location("v9_agent", path)
@@ -109,6 +127,8 @@ def build_opponent(name: str, cfg=None, device=None):
         return RandomOpponent()
     if name == "self":
         return SelfPlayOpponent(cfg, device)
+    if name == "v11":
+        return V11Opponent()
     if name == "v9":
         return V9Opponent()
-    raise ValueError(f"Unknown opponent: {name}")
+    raise ValueError(f"Unknown opponent: {name!r}")

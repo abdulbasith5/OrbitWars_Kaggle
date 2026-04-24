@@ -1,14 +1,23 @@
 """
-train.py — Main PPO training loop for Orbit Wars.
+train.py — Elite PPO training loop v2 for Orbit Wars.
+
+3-Phase Curriculum:
+  Phase 1 (0 → --random-end):     vs random (fast warm-up)
+  Phase 2 (--random-end → --selfplay-start): vs v11 heuristic (learn real strategy)
+  Phase 3 (--selfplay-start → end): self-play (continuous improvement)
 
 Run:
-    python train.py                        # default settings
-    python train.py --updates 2000         # full training
-    python train.py --opponent v9          # train vs our heuristic agent
-    python train.py --resume checkpoints/ckpt_001000.pt
+    # Local quick test (CPU)
+    python train.py --updates 100 --envs 2 --opponent v11
 
-Progress is printed every --log-every updates.
-Checkpoints saved every --ckpt-every updates to ./checkpoints/
+    # Full elite training (GPU recommended)
+    python train.py --updates 5000 --envs 8 --opponent v11 --device cuda
+
+    # Resume from checkpoint
+    python train.py --resume checkpoints/ckpt_001000.pt --updates 5000
+
+    # Kaggle Notebook (GPU P100 ~6hrs for 5000 updates)
+    python train.py --updates 5000 --envs 8 --device cuda --opponent v11
 """
 from __future__ import annotations
 
@@ -23,7 +32,6 @@ from pathlib import Path
 import numpy as np
 import torch
 
-# Allow running from the rl/ directory
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src.config import TrainConfig, default_config
@@ -40,16 +48,18 @@ from src.ppo import RolloutBuffer, Transition, ppo_update
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train Orbit Wars PPO agent")
-    p.add_argument("--updates",    type=int,   default=2000,         help="Total PPO updates")
-    p.add_argument("--envs",       type=int,   default=4,            help="Parallel envs")
-    p.add_argument("--opponent",   type=str,   default="random",     help="random | self | v9")
-    p.add_argument("--device",     type=str,   default="auto",       help="auto | cpu | cuda")
-    p.add_argument("--resume",     type=str,   default=None,         help="Path to checkpoint")
-    p.add_argument("--ckpt-every", type=int,   default=100,          help="Save every N updates")
-    p.add_argument("--log-every",  type=int,   default=10,           help="Log every N updates")
-    p.add_argument("--selfplay-start", type=int, default=200,        help="Switch to self-play after N updates")
-    p.add_argument("--seed",       type=int,   default=42)
+    p = argparse.ArgumentParser(description="Train Orbit Wars Elite PPO agent")
+    p.add_argument("--updates",        type=int,   default=5000,     help="Total PPO updates")
+    p.add_argument("--envs",           type=int,   default=4,        help="Parallel envs")
+    p.add_argument("--opponent",       type=str,   default="v11",    help="random | v11 | self")
+    p.add_argument("--device",         type=str,   default="auto",   help="auto | cpu | cuda")
+    p.add_argument("--resume",         type=str,   default=None,     help="Path to checkpoint .pt")
+    p.add_argument("--ckpt-every",     type=int,   default=200,      help="Save every N updates")
+    p.add_argument("--log-every",      type=int,   default=10,       help="Log every N updates")
+    p.add_argument("--random-end",     type=int,   default=200,      help="End random phase")
+    p.add_argument("--selfplay-start", type=int,   default=1000,     help="Start self-play phase")
+    p.add_argument("--no-shaping",     action="store_true",          help="Disable dense reward shaping")
+    p.add_argument("--seed",           type=int,   default=42)
     return p.parse_args()
 
 
@@ -77,15 +87,13 @@ def collect_rollout(
     device: torch.device,
     rollout_steps: int,
 ) -> dict:
-    """
-    Run all envs for rollout_steps total steps, storing transitions.
-    Returns episode stats.
-    """
-    ep_rewards   = []
-    ep_lengths   = []
-    active_rews  = [0.0] * len(envs)
-    active_lens  = [0]   * len(envs)
-    obs_list     = [env.reset(seed=None) for env in envs]
+    ep_rewards  = []
+    ep_lengths  = []
+    ep_wins     = []
+    active_rews = [0.0] * len(envs)
+    active_lens = [0]   * len(envs)
+    active_term = [0.0] * len(envs)   # terminal reward tracker
+    obs_list    = [env.reset(seed=None) for env in envs]
 
     policy.eval()
     steps_taken = 0
@@ -93,11 +101,13 @@ def collect_rollout(
     while steps_taken < rollout_steps:
         for env_idx, (env, batch) in enumerate(zip(envs, obs_list)):
             if batch.self_features.shape[0] == 0:
-                # No planets — step with empty action
-                obs_list[env_idx], rew, done, _ = env.step([])
+                obs_list[env_idx], rew, done, info = env.step([])
+                active_rews[env_idx] += rew
+                active_lens[env_idx] += 1
                 if done:
                     ep_rewards.append(active_rews[env_idx])
                     ep_lengths.append(active_lens[env_idx])
+                    ep_wins.append(1.0 if info.get("reward", 0) > 0 else 0.0)
                     active_rews[env_idx] = 0.0
                     active_lens[env_idx] = 0
                     obs_list[env_idx] = env.reset()
@@ -116,7 +126,6 @@ def collect_rollout(
             lps     = sampled.log_prob.cpu().numpy()
             vals    = out.values.cpu().numpy()
 
-            # Build action list
             moves = []
             for i, ctx in enumerate(batch.contexts):
                 idx = int(indices[i])
@@ -126,8 +135,7 @@ def collect_rollout(
                 if ships <= 0: continue
                 moves.append([ctx.source_id, float(ctx.target_angles[idx]), ships])
 
-            # Store transitions (one per source planet)
-            next_batch, rew, done, _ = env.step(moves)
+            next_batch, rew, done, info = env.step(moves)
             active_rews[env_idx] += rew
             active_lens[env_idx] += 1
 
@@ -147,6 +155,7 @@ def collect_rollout(
             if done:
                 ep_rewards.append(active_rews[env_idx])
                 ep_lengths.append(active_lens[env_idx])
+                ep_wins.append(1.0 if info.get("reward", 0) > 0 else 0.0)
                 active_rews[env_idx] = 0.0
                 active_lens[env_idx] = 0
                 obs_list[env_idx] = env.reset()
@@ -162,6 +171,7 @@ def collect_rollout(
         "ep_reward_mean": float(np.mean(ep_rewards)) if ep_rewards else 0.0,
         "ep_reward_min":  float(np.min(ep_rewards))  if ep_rewards else 0.0,
         "ep_reward_max":  float(np.max(ep_rewards))  if ep_rewards else 0.0,
+        "win_rate":       float(np.mean(ep_wins))    if ep_wins    else 0.0,
         "n_episodes":     len(ep_rewards),
     }
 
@@ -178,14 +188,20 @@ def main():
     cfg.num_envs         = args.envs
     cfg.checkpoint_every = args.ckpt_every
     cfg.log_every        = args.log_every
+    cfg.random_end       = args.random_end
     cfg.selfplay_start   = args.selfplay_start
+    cfg.use_shaping_reward = not args.no_shaping
 
     ckpt_dir = Path("checkpoints")
     ckpt_dir.mkdir(exist_ok=True)
 
+    print(f"=== Orbit Wars Elite PPO Training ===")
     print(f"Device: {device}")
-    print(f"Opponent: {args.opponent}  |  Envs: {cfg.num_envs}  |  Updates: {cfg.total_updates}")
-    print(f"Self-play starts at update {cfg.selfplay_start}")
+    print(f"Model: hidden={cfg.model.hidden_size}, heads={cfg.model.num_heads}")
+    print(f"Features: self={self_feature_dim()}, cand={candidate_feature_dim()}, global={global_feature_dim()}")
+    print(f"Curriculum: random(0-{cfg.random_end}) -> {args.opponent}({cfg.random_end}-{cfg.selfplay_start}) -> self-play")
+    print(f"Shaping reward: {cfg.use_shaping_reward}")
+    print(f"Rollout: {cfg.ppo.rollout_steps} steps, {cfg.num_envs} envs, {cfg.total_updates} updates")
     print()
 
     # ── Policy ────────────────────────────────────────────────────────────────
@@ -195,50 +211,64 @@ def main():
         global_dim      = global_feature_dim(),
         candidate_count = cfg.env.candidate_count,
         hidden_size     = cfg.model.hidden_size,
+        num_heads       = cfg.model.num_heads,
+        dropout         = cfg.model.dropout,
     ).to(device)
 
-    optimizer  = torch.optim.Adam(policy.parameters(), lr=cfg.ppo.lr)
-    start_upd  = 0
+    n_params = sum(p.numel() for p in policy.parameters())
+    print(f"Policy parameters: {n_params:,}")
 
+    optimizer = torch.optim.AdamW(
+        policy.parameters(), lr=cfg.ppo.lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=cfg.total_updates, eta_min=cfg.ppo.lr * 0.1)
+
+    start_upd = 0
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         policy.load_state_dict(ckpt["policy"])
-        optimizer.load_state_dict(ckpt["optimizer"])
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
         start_upd = ckpt.get("update", 0)
         print(f"Resumed from {args.resume} at update {start_upd}")
 
-    # ── Opponents ─────────────────────────────────────────────────────────────
-    init_opponent = build_opponent(args.opponent, cfg=cfg, device=device)
-    selfplay_opp  = SelfPlayOpponent(cfg, device=device)
+    # ── Opponent schedule ─────────────────────────────────────────────────────
+    random_opp   = RandomOpponent()
+    mid_opp      = build_opponent(args.opponent, cfg=cfg, device=device)
+    selfplay_opp = SelfPlayOpponent(cfg, device=device)
 
-    def current_opponent(update: int):
-        if update < cfg.selfplay_start:
-            return init_opponent
-        return selfplay_opp
+    def get_opponent(update: int):
+        if update < cfg.random_end:
+            return random_opp, "random"
+        elif update < cfg.selfplay_start:
+            return mid_opp, args.opponent
+        return selfplay_opp, "self-play"
 
-    # ── Environments ──────────────────────────────────────────────────────────
-    # We rebuild envs when opponent switches (lazy rebuild)
     def make_envs(opp):
         return [OrbitWarsEnv(cfg, opp, env_index=i) for i in range(cfg.num_envs)]
 
-    envs   = make_envs(init_opponent)
+    prev_phase = None
+    envs = make_envs(random_opp)
     buffer = RolloutBuffer()
 
-    # ── Tracking ──────────────────────────────────────────────────────────────
-    reward_window = deque(maxlen=50)
-    t0            = time.time()
+    reward_window  = deque(maxlen=100)
+    win_window     = deque(maxlen=100)
+    t0 = time.time()
 
     # ── Training Loop ─────────────────────────────────────────────────────────
     for update in range(start_upd, cfg.total_updates):
+        opp, phase = get_opponent(update)
 
-        # Switch to self-play
-        if update == cfg.selfplay_start:
-            selfplay_opp.sync_from(policy)
-            envs = make_envs(selfplay_opp)
-            print(f"\n[Update {update}] Switched to SELF-PLAY\n")
+        # Rebuild envs on phase change
+        if phase != prev_phase:
+            if phase == "self-play":
+                selfplay_opp.sync_from(policy)
+            envs = make_envs(opp)
+            prev_phase = phase
+            print(f"\n[Update {update}] Phase switch -> {phase}\n")
 
         # Sync self-play opponent periodically
-        if (update >= cfg.selfplay_start and
+        if (phase == "self-play" and
                 (update - cfg.selfplay_start) % cfg.selfplay_sync_every == 0):
             selfplay_opp.sync_from(policy)
 
@@ -249,6 +279,7 @@ def main():
             rollout_steps=cfg.ppo.rollout_steps,
         )
         reward_window.extend([ep_stats["ep_reward_mean"]])
+        win_window.extend([ep_stats["win_rate"]])
 
         # PPO update
         if len(buffer) > 0:
@@ -256,19 +287,24 @@ def main():
         else:
             continue
 
+        scheduler.step()
+
         # Logging
         if (update + 1) % cfg.log_every == 0:
-            elapsed = time.time() - t0
-            rew_avg = float(np.mean(reward_window)) if reward_window else 0.0
-            phase   = "self-play" if update >= cfg.selfplay_start else args.opponent
+            elapsed  = time.time() - t0
+            rew_avg  = float(np.mean(reward_window))  if reward_window else 0.0
+            win_avg  = float(np.mean(win_window))     if win_window    else 0.0
+            lr_now   = scheduler.get_last_lr()[0]
             print(
-                f"[{update+1:4d}/{cfg.total_updates}] "
-                f"rew={rew_avg:+.3f}  "
+                f"[{update+1:5d}/{cfg.total_updates}] "
+                f"rew={rew_avg:+.4f}  "
+                f"win={win_avg:.2%}  "
                 f"pol={ppo_stats.policy_loss:+.4f}  "
                 f"val={ppo_stats.value_loss:.4f}  "
                 f"ent={ppo_stats.entropy:.3f}  "
                 f"clip={ppo_stats.clip_frac:.2f}  "
                 f"eps={ep_stats['n_episodes']}  "
+                f"lr={lr_now:.2e}  "
                 f"phase={phase}  "
                 f"t={elapsed:.0f}s"
             )
@@ -280,14 +316,17 @@ def main():
                 "update":    update + 1,
                 "policy":    policy.state_dict(),
                 "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
                 "cfg":       cfg,
             }, ckpt_path)
-            print(f"  → Saved {ckpt_path}")
+            print(f"  -> Saved {ckpt_path}")
 
     # Final save
     final_path = ckpt_dir / "ckpt_final.pt"
-    torch.save({"update": cfg.total_updates, "policy": policy.state_dict()}, final_path)
+    torch.save({"update": cfg.total_updates, "policy": policy.state_dict(),
+                "cfg": cfg}, final_path)
     print(f"\nTraining complete. Final model: {final_path}")
+    print(f"Total time: {(time.time()-t0)/3600:.2f}h")
 
 
 if __name__ == "__main__":

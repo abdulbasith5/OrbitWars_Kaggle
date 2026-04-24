@@ -589,18 +589,135 @@ def _logistics(my_planets, enemy_planets, cfg):
     return []
 
 
+# ─── RL Policy Loader (optional — used when weights available) ────────────────
+
+_rl_policy   = None   # cached policy; None = not loaded yet
+_rl_failed   = False  # True = RL loading failed, use heuristic always
+
+# Paths searched for weights (submission bundle or local training)
+_CKPT_PATHS = [
+    os.path.join(os.path.dirname(__file__), "rl", "checkpoints", "ckpt_final.pt"),
+    os.path.join(os.path.dirname(__file__), "ckpt_final.pt"),
+    "rl/checkpoints/ckpt_final.pt",
+    "ckpt_final.pt",
+]
+
+
+def _try_load_rl_policy():
+    global _rl_policy, _rl_failed
+    if _rl_failed:
+        return None
+    if _rl_policy is not None:
+        return _rl_policy
+    try:
+        import torch
+        # Find checkpoint
+        ckpt_path = None
+        for p in _CKPT_PATHS:
+            if os.path.isfile(p):
+                ckpt_path = p
+                break
+        if ckpt_path is None:
+            _rl_failed = True
+            return None
+
+        # Dynamically import RL modules (may not be present in submission)
+        import importlib.util, sys as _sys
+        rl_src = os.path.join(os.path.dirname(__file__), "rl", "src")
+        if rl_src not in _sys.path:
+            _sys.path.insert(0, rl_src)
+
+        from policy import PlanetPolicy
+        from features import self_feature_dim, candidate_feature_dim, global_feature_dim
+
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        cfg_saved = ckpt.get("cfg", None)
+
+        hidden_size = 512
+        num_heads   = 4
+        if cfg_saved is not None:
+            try:
+                hidden_size = cfg_saved.model.hidden_size
+                num_heads   = cfg_saved.model.num_heads
+            except Exception:
+                pass
+
+        pol = PlanetPolicy(
+            self_dim        = self_feature_dim(),
+            candidate_dim   = candidate_feature_dim(),
+            global_dim      = global_feature_dim(),
+            candidate_count = 18,
+            hidden_size     = hidden_size,
+            num_heads       = num_heads,
+            dropout         = 0.0,
+        )
+        pol.load_state_dict(ckpt["policy"])
+        pol.eval()
+        _rl_policy = pol
+        return pol
+    except Exception:
+        _rl_failed = True
+        return None
+
+
+def _rl_agent_moves(obs, pol):
+    """Run the RL policy to select target planets, return moves list."""
+    try:
+        import torch
+        import sys as _sys
+        rl_src = os.path.join(os.path.dirname(__file__), "rl", "src")
+        if rl_src not in _sys.path:
+            _sys.path.insert(0, rl_src)
+        from features import encode_turn, EnvConfig
+        from policy import sample_actions
+
+        cfg_env = EnvConfig()
+        batch = encode_turn(obs, cfg_env, env_index=0)
+        if batch.self_features.shape[0] == 0:
+            return []
+
+        with torch.inference_mode():
+            out = pol(
+                torch.from_numpy(batch.self_features),
+                torch.from_numpy(batch.candidate_features),
+                torch.from_numpy(batch.global_features),
+                torch.from_numpy(batch.candidate_mask),
+            )
+            sampled = sample_actions(out, deterministic=True)
+
+        indices = sampled.target_index.cpu().numpy()
+        moves = []
+        for i, ctx in enumerate(batch.contexts):
+            idx = int(indices[i])
+            if idx == 0 or idx >= len(ctx.candidate_ids): continue
+            if not ctx.candidate_mask[idx]: continue
+            ships = int(ctx.ship_counts[idx])
+            if ships <= 0: continue
+            moves.append([ctx.source_id, float(ctx.target_angles[idx]), ships])
+        return moves
+    except Exception:
+        return None
+
+
 # ─── Agent Entry Point ────────────────────────────────────────────────────────
 
 def agent(obs, config=None):
     """
-    Orbit Wars agent — v11 "Defensive Blitz".
-    Pipeline:
-      1. Build fleet arrival timeline (who lands where and when)
-      2. Emergency defense   — uses arrival-time garrison
-      3. Neutral expansion   — v10: grab from turn 1, multi-target blitz
-      4. Enemy attack        — timed convergence + arrival-time need + time scoring
-      5. Counter-attack      — snipe weak enemies
-      6. Logistics           — redistribute surplus
+    Orbit Wars hybrid agent — v11 heuristic + optional RL policy overlay.
+
+    If rl/checkpoints/ckpt_final.pt exists and loads successfully:
+      → Uses RL policy for target selection (learned strategy)
+      → Falls back to v11 heuristic if RL returns empty moves
+
+    Otherwise:
+      → Pure v11 "Defensive Blitz" heuristic
+
+    v11 Pipeline:
+      1. Emergency defense   (arrival-time garrison simulation)
+      2. Neutral expansion   (phase-0 blitz, multi-target, central bonus)
+      3. Enemy attack        (timed convergence, garrison safety)
+      4. Counter-attack      (snipe weak enemies)
+      5. Logistics           (surplus redistribution)
     """
     me, planets, fleets, comets, comet_ids, step, ang_vel = _unpack_obs(obs)
     cfg = _load_params()
@@ -611,15 +728,20 @@ def agent(obs, config=None):
 
     if not my_planets: return []
 
-    phase = _detect_phase(step, planets, my_planets, enemy_planets)
+    # ── Try RL policy first ────────────────────────────────────────────────────
+    pol = _try_load_rl_policy()
+    if pol is not None:
+        rl_moves = _rl_agent_moves(obs, pol)
+        if rl_moves:   # RL produced valid moves
+            return rl_moves
 
-    # Build the core arrival timeline — used by ALL passes
+    # ── Fallback: v11 heuristic ───────────────────────────────────────────────
+    phase = _detect_phase(step, planets, my_planets, enemy_planets)
     fleet_arrivals = _build_fleet_arrivals(planets, fleets, ang_vel)
 
     def_actions, def_committed = _emergency_defense(
         my_planets, planets, fleets, me, ang_vel, cfg, fleet_arrivals)
 
-    # v10: pass step for time-aware scoring
     neu_actions, neu_committed = _neutral_expansion(
         my_planets, neutrals, comets, planets, fleets,
         ang_vel, me, phase, cfg, def_committed, fleet_arrivals, step=step)
