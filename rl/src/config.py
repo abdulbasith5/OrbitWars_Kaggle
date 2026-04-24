@@ -22,15 +22,17 @@ class ModelConfig:
 
 @dataclass
 class PPOConfig:
-    lr: float = 3e-4
+    lr: float = 2e-4            # v9 was 3e-4; slightly lower for stability
     gamma: float = 0.99          # discount factor
     gae_lambda: float = 0.95     # GAE lambda
     clip_eps: float = 0.2        # PPO clip epsilon
     value_coef: float = 0.5      # value loss coefficient
-    entropy_coef: float = 0.02   # entropy bonus coefficient
+    entropy_coef: float = 0.05   # v9 was 0.02; raised to PREVENT entropy collapse
+                                 # Training showed entropy: 0.148->0.031 (collapsed)
+                                 # At ent=0.031 policy uses only 1 of 18 candidates
     ppo_epochs: int = 4          # epochs per update
     batch_size: int = 256        # minibatch size
-    rollout_steps: int = 512     # steps to collect before update
+    rollout_steps: int = 1024    # v9 was 512; ~4 episodes per rollout (was ~2)
     max_grad_norm: float = 0.5
 
 
@@ -51,8 +53,9 @@ class TrainConfig:
     # Opponent schedule
     # "random"  = always play vs random
     # "self"    = always self-play
+    # "v9"      = train against our heuristic agent (recommended)
     # Switch after this many updates:
-    selfplay_start: int = 200    # switch to self-play after N updates
+    selfplay_start: int = 300    # v9 was 200; give more random warm-up before self-play
     selfplay_sync_every: int = 50  # sync opponent weights every N updates
     alternate_player_sides: bool = True  # alternate who is player 0/1
 
