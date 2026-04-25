@@ -54,7 +54,7 @@ def parse_args():
     p.add_argument("--opponent",       type=str,   default="v11",    help="random | v11 | self")
     p.add_argument("--device",         type=str,   default="auto",   help="auto | cpu | cuda")
     p.add_argument("--resume",         type=str,   default=None,     help="Path to checkpoint .pt")
-    p.add_argument("--ckpt-every",     type=int,   default=200,      help="Save every N updates")
+    p.add_argument("--ckpt-every",     type=int,   default=100,      help="Save every N updates")
     p.add_argument("--log-every",      type=int,   default=10,       help="Log every N updates")
     p.add_argument("--random-end",     type=int,   default=200,      help="End random phase")
     p.add_argument("--selfplay-start", type=int,   default=1000,     help="Start self-play phase")
