@@ -197,6 +197,20 @@ def main():
 
     print(f"=== Orbit Wars Elite PPO Training ===")
     print(f"Device: {device}")
+    # ── Pre-load checkpoint config (so policy is built with correct size) ────────
+    resume_ckpt = None
+    if args.resume:
+        resume_ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        ckpt_cfg = resume_ckpt.get("cfg", None)
+        if ckpt_cfg is not None:
+            try:
+                cfg.model.hidden_size = ckpt_cfg.model.hidden_size
+                cfg.model.num_heads   = ckpt_cfg.model.num_heads
+                cfg.model.dropout     = ckpt_cfg.model.dropout
+                print(f"Checkpoint config: hidden={cfg.model.hidden_size}, heads={cfg.model.num_heads}")
+            except Exception as e:
+                print(f"Could not read checkpoint config ({e}), using CLI config")
+
     print(f"Model: hidden={cfg.model.hidden_size}, heads={cfg.model.num_heads}")
     print(f"Features: self={self_feature_dim()}, cand={candidate_feature_dim()}, global={global_feature_dim()}")
     print(f"Curriculum: random(0-{cfg.random_end}) -> {args.opponent}({cfg.random_end}-{cfg.selfplay_start}) -> self-play")
@@ -224,12 +238,19 @@ def main():
         optimizer, T_max=cfg.total_updates, eta_min=cfg.ppo.lr * 0.1)
 
     start_upd = 0
-    if args.resume:
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        policy.load_state_dict(ckpt["policy"])
-        if "optimizer" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer"])
-        start_upd = ckpt.get("update", 0)
+    if resume_ckpt is not None:
+        policy.load_state_dict(resume_ckpt["policy"])
+        if "optimizer" in resume_ckpt:
+            try:
+                optimizer.load_state_dict(resume_ckpt["optimizer"])
+            except Exception:
+                print("Optimizer state incompatible, starting optimizer fresh")
+        if "scheduler" in resume_ckpt:
+            try:
+                scheduler.load_state_dict(resume_ckpt["scheduler"])
+            except Exception:
+                pass
+        start_upd = resume_ckpt.get("update", 0)
         print(f"Resumed from {args.resume} at update {start_upd}")
 
     # ── Opponent schedule ─────────────────────────────────────────────────────
