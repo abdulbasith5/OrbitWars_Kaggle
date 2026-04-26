@@ -35,8 +35,7 @@ class ResidualMLP(nn.Module):
             if i < len(dims) - 2:
                 mods.append(nn.LayerNorm(dims[i+1]))
                 mods.append(nn.GELU())
-                if dropout > 0:
-                    mods.append(nn.Dropout(dropout))
+                mods.append(nn.Dropout(dropout))
         self.net = nn.Sequential(*mods)
         # Residual projection if needed
         self.residual = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
