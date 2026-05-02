@@ -71,14 +71,27 @@ policy = PlanetPolicy(
 ).to(gpu0)
 
 # ── Self-play opponent on GPU 1 ───────────────────────────────────────────────
-opp_policy = PlanetPolicy(
-    self_dim=self_feature_dim(), candidate_dim=candidate_feature_dim(),
-    global_dim=global_feature_dim(), candidate_count=cfg.env.candidate_count,
-    hidden_size=cfg.model.hidden_size, num_heads=cfg.model.num_heads, dropout=0.0,
-).to(gpu1)
-opp_policy.eval()
+def _build_opp_policy():
+    """Always build opp_policy fresh from current cfg so keys/shapes always match."""
+    global opp_policy
+    opp_policy = PlanetPolicy(
+        self_dim=self_feature_dim(), candidate_dim=candidate_feature_dim(),
+        global_dim=global_feature_dim(), candidate_count=cfg.env.candidate_count,
+        hidden_size=cfg.model.hidden_size, num_heads=cfg.model.num_heads, dropout=0.0,
+    ).to(gpu1)
+    opp_policy.eval()
 
-def sync_opp(): opp_policy.load_state_dict(policy.state_dict())
+_build_opp_policy()
+
+def sync_opp():
+    """Sync opponent weights from training policy. Rebuilds if architectures diverged."""
+    global opp_policy
+    try:
+        opp_policy.load_state_dict(policy.state_dict())
+    except RuntimeError:
+        print("[sync_opp] Architecture mismatch — rebuilding opp_policy from current cfg.")
+        _build_opp_policy()
+        opp_policy.load_state_dict(policy.state_dict())
 
 class SelfPlayOpp:
     def act(self, obs):
@@ -119,19 +132,14 @@ if RESUME_CKPT and os.path.isfile(RESUME_CKPT):
             cfg.model.hidden_size = ck_cfg.model.hidden_size
             cfg.model.num_heads   = ck_cfg.model.num_heads
         except: pass
-    # Rebuild with correct size if needed
+    # Rebuild policy and opp_policy with the checkpoint's architecture
     policy = PlanetPolicy(
         self_dim=self_feature_dim(), candidate_dim=candidate_feature_dim(),
         global_dim=global_feature_dim(), candidate_count=cfg.env.candidate_count,
         hidden_size=cfg.model.hidden_size, num_heads=cfg.model.num_heads,
         dropout=cfg.model.dropout,
     ).to(gpu0)
-    opp_policy = PlanetPolicy(
-        self_dim=self_feature_dim(), candidate_dim=candidate_feature_dim(),
-        global_dim=global_feature_dim(), candidate_count=cfg.env.candidate_count,
-        hidden_size=cfg.model.hidden_size, num_heads=cfg.model.num_heads, dropout=0.0,
-    ).to(gpu1)
-    opp_policy.eval()
+    _build_opp_policy()   # rebuild opp_policy to match updated cfg exactly
     policy.load_state_dict(ck['policy'])
     start_update = ck.get('update', 0)
     print(f"Resumed from {RESUME_CKPT} at update {start_update}")
