@@ -52,41 +52,42 @@ EXPANSION_STEP_LIMIT = 120   # steps before which we prioritize neutrals over at
 # ─── Defaults ─────────────────────────────────────────────────────────────────
 # v10: RL-informed parameter tuning
 DEFAULT_CONFIG = {
-    # Reserve (lower in phase 0 to stop 10-turn idle)
-    "min_reserve": 4.0,           # v9: 5.0  — freed up ships for early grab
-    "reserve_prod_mult": 1.2,
-    "reserve_threat_bonus": 12.0,
-    "reserve_floor": 3.0,         # v9: 6.0  — allow aggressive early sends
-    "grab_reserve_floor": 3.0,    # NEW: ultra-low floor in phase-0 blitz
+    # Reserve
+    "min_reserve": 3.0,           # v12: lowered — more ships available to send
+    "reserve_prod_mult": 1.0,     # v12: reduced — less hoarding
+    "reserve_threat_bonus": 10.0,
+    "reserve_floor": 3.0,
+    "grab_reserve_floor": 2.0,    # v12: ultra-aggressive blitz floor
 
-    # Scoring (RL confirmed production > distance in early game)
-    "score_production_mult": 18.0,    # v9: 14.0 — production matters more
-    "score_neutral_bonus": 12.0,      # v9: 15.0 — slightly reduced flat bonus
-    "score_enemy_bonus": 22.0,
-    "score_enemy_prod_bonus": 8.0,    # v9: 4.0  — punish high-prod enemies harder
-    "score_distance_penalty": 0.35,   # v9: 0.4  — don't penalize range as much
-    "score_amount_penalty": 0.7,      # v9: 0.8  — send more, penalize less
-    "score_comet_bonus": 30.0,
-    "score_time_mult": 0.008,         # NEW: multiply prod score by turns_remaining
+    # Scoring — production is the key resource
+    "score_production_mult": 25.0,    # v12: was 18.0 — production matters most
+    "score_neutral_bonus": 10.0,
+    "score_enemy_bonus": 28.0,        # v12: was 22.0 — attack enemies harder
+    "score_enemy_prod_bonus": 12.0,   # v12: was 8.0  — punish high-prod enemies
+    "score_distance_penalty": 0.28,   # v12: was 0.35 — range matters less
+    "score_amount_penalty": 0.6,      # v12: was 0.7  — send more ships
+    "score_comet_bonus": 35.0,        # v12: higher comet priority
+    "score_time_mult": 0.015,         # v12: was 0.008 — urgency increases faster
 
-    # Attack thresholds
-    "attack_min_score": 0.25,         # v9: 0.3  — attack slightly more
-    "attack_ratio": 0.80,
-    "early_min_score": 0.05,          # v9: 0.1  — very low bar for early grabs
+    # Attack thresholds — lower = more aggressive
+    "attack_min_score": 0.18,         # v12: was 0.25 — attack more targets
+    "attack_ratio": 0.85,             # v12: was 0.80
+    "early_min_score": 0.03,          # v12: was 0.05 — very aggressive early
     "early_turns": 40.0, "grab_turns": 20.0,
 
-    # Expansion width (RL: simultaneous multi-target beats sequential)
-    "converge_max_sources": 6,        # v9: 5
-    "max_parallel_neutrals": 12,      # v9: 8  — grab more at once
+    # Expansion width — wider simultaneous expansion wins
+    "converge_max_sources": 8,        # v12: was 6
+    "max_parallel_neutrals": 16,      # v12: was 12
 
-    # Margins (phase-0 uses grab_margin_neutral=1, later uses margin_neutral)
+    # Margins
     "margin_neutral": 2,
-    "grab_margin_neutral": 1,         # NEW: only 1 extra ship in phase-0 blitz
-    "margin_enemy": 3,
+    "grab_margin_neutral": 1,
+    "margin_enemy": 2,                # v12: was 3 — less padding on attacks
 
-    "counter_ratio": 1.3,
+    "counter_ratio": 1.2,             # v12: was 1.3 — counter-attack more often
     "defense_threat_radius": 35.0, "threat_radius_planet": 25.0,
-    "logistics_surplus_min": 15.0, "logistics_ratio": 0.40,
+    "logistics_surplus_min": 12.0,    # v12: was 15.0 — redistribute more
+    "logistics_ratio": 0.45,          # v12: was 0.40
     "defense_transfer_ratio": 0.35,
     # Arrival-time
     "arrival_sim_horizon": 80,
@@ -474,11 +475,11 @@ def _enemy_attack(my_planets, enemy_planets, all_planets, fleets,
     # — prioritize neutral grabs over risky assaults
     neutrals_exist = any(p.owner == -1 for p in all_planets)
     if step < EXPANSION_STEP_LIMIT and neutrals_exist and len(enemy_planets) > 0:
-        # Only attack if we clearly outnumber the enemy total ships
+        # v12: attack if we have any advantage (was 1.2x — too passive)
         my_total = sum(p.ships for p in my_planets) + sum(f.ships for f in fleets if f.owner == me)
         en_total = sum(p.ships for p in enemy_planets) + sum(f.ships for f in fleets if f.owner not in (-1, me))
-        if my_total < en_total * 1.2:
-            return [], atk_committed  # don't over-extend during expansion
+        if my_total < en_total * 1.05:
+            return [], atk_committed  # only hold back if clearly losing
 
     scored = sorted(enemy_planets,
                     key=lambda t: -(cfg["score_production_mult"] * t.production * time_factor +
@@ -595,9 +596,18 @@ _rl_policy   = None   # cached policy; None = not loaded yet
 _rl_failed   = False  # True = RL loading failed, use heuristic always
 
 # Paths searched for weights (submission bundle or local training)
-_CKPT_PATHS = [
-    os.path.join(os.path.dirname(__file__), "rl", "checkpoints", "ckpt_final.pt"),
-    os.path.join(os.path.dirname(__file__), "ckpt_final.pt"),
+# Note: __file__ is not defined when Kaggle runs agents via exec(), so guard it
+_CKPT_PATHS = []
+try:
+    _CKPT_PATHS += [
+        os.path.join(os.path.dirname(__file__), "rl", "checkpoints", "ckpt_final.pt"),
+        os.path.join(os.path.dirname(__file__), "ckpt_final.pt"),
+    ]
+except NameError:
+    pass  # exec() context: __file__ not available
+_CKPT_PATHS += [
+    "/kaggle/simulations/agent/ckpt_final.pt",           # Kaggle sim root
+    "/kaggle/simulations/agent/rl/checkpoints/ckpt_final.pt",
     "rl/checkpoints/ckpt_final.pt",
     "ckpt_final.pt",
 ]
@@ -621,11 +631,14 @@ def _try_load_rl_policy():
             _rl_failed = True
             return None
 
-        # Dynamically import RL modules (may not be present in submission)
-        import importlib.util, sys as _sys
-        rl_src = os.path.join(os.path.dirname(__file__), "rl", "src")
-        if rl_src not in _sys.path:
-            _sys.path.insert(0, rl_src)
+        # Dynamically import RL modules — hardcode paths for Kaggle exec() context
+        import sys as _sys
+        for rl_src in [
+            "/kaggle/simulations/agent/rl/src",   # Kaggle simulation root
+            "rl/src",                              # relative fallback
+        ]:
+            if os.path.isdir(rl_src) and rl_src not in _sys.path:
+                _sys.path.insert(0, rl_src)
 
         from policy import PlanetPolicy
         from features import self_feature_dim, candidate_feature_dim, global_feature_dim
